@@ -11,21 +11,36 @@ anything ASE reads) and a directory of UPF pseudopotentials, this script runs
      insulators, used for the LO-TO non-analytic correction)
   5. phonon dispersion + projected DOS plot
 
-Each stage is submitted to Slurm and the script waits for it. Progress is kept
-in <workdir>/state.json and finished outputs are never recomputed, so the
-script can be killed and rerun with the same arguments to resume.
+Each stage is submitted to Slurm and the driver waits for it. Progress is kept
+in <workdir>/state.json and finished outputs are never recomputed, so a run
+can be stopped and restarted at any point.
 
-Example (run on a login node; it mostly sleeps while jobs run):
-  nohup python autophonon.py --name NaCl --structure NaCl.cif \
-      --pseudo-dir pseudo > NaCl_auto.log 2>&1 &
+Usage:
+  autophonon.py init --name Si --structure Si.cif --pseudo-dir pseudo
+        write Si.yaml listing every option and its default
+  autophonon.py submit Si.yaml [--dry-run]
+        start the driver as a 1-core Slurm job (it resubmits itself if it
+        runs out of walltime); output goes to <workdir>/driver.log
+  autophonon.py status Si.yaml|<workdir>
+        stages done, jobs in the queue, recent log lines
+  autophonon.py run Si.yaml [--dry-run]
+        run the driver in the foreground (what the driver job executes);
+        --dry-run writes the next stage's inputs and job scripts without
+        submitting them
+
+Options can also be given as flags (they override the config file), e.g.
+  autophonon.py run --name NaCl --structure NaCl.cif --pseudo-dir pseudo
 """
 import argparse
 import glob
+import itertools
 import json
 import math
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -132,7 +147,6 @@ def rattle(lattice, positions, amplitude, seed=7):
 
 def repeat_cell(lattice, positions, numbers, n):
     """n x n x n supercell (lattice rows in Angstrom, fractional positions)."""
-    import itertools
     shifts = np.array(list(itertools.product(range(n), repeat=3)), dtype=float)
     pos = np.array(positions, dtype=float)
     new_pos = ((pos[:, None, :] + shifts[None, :, :]) / n).reshape(-1, 3)
@@ -272,10 +286,22 @@ def scratch_dir(cfg, directory):
     return os.path.join(cfg["scratch"], os.path.relpath(directory, cfg["work"]))
 
 
+class DryRunStop(Exception):
+    """Raised once a dry run has written the job scripts of the next stage."""
+
+
+class WalltimeSignal(Exception):
+    """Slurm warned the driver job that its walltime is about to end."""
+
+
 def submit(cfg, directory, name, runs, walltime):
+    """Write <name>.slurm and sbatch it. Returns the job id (None in a dry run)."""
     path = os.path.join(directory, f"{name}.slurm")
     with open(path, "w") as f:
         f.write(job_script(cfg, name, runs, walltime, scratch_dir(cfg, directory)))
+    if cfg.get("dry_run"):
+        log(f"  dry run: wrote {os.path.relpath(path, cfg['work'])} (not submitted)")
+        return None
     out = subprocess.run(["sbatch", "--parsable", os.path.basename(path)],
                          cwd=directory, capture_output=True, text=True, check=True)
     jobid = out.stdout.strip().split(";")[0]
@@ -309,6 +335,79 @@ def default_scratch(requested, work):
     return os.path.join(work, "tmp")
 
 
+def preflight(cfg, pseudos, a):
+    """Cheap checks before anything is submitted."""
+    if not cfg["dry_run"] and not shutil.which("sbatch"):
+        raise RuntimeError("sbatch not found; run on a cluster login node or in a Slurm job")
+    try:
+        os.makedirs(cfg["scratch"], exist_ok=True)
+        probe = os.path.join(cfg["scratch"], f".write_test_{os.getpid()}")
+        open(probe, "w").close()
+        os.remove(probe)
+    except OSError as exc:
+        raise RuntimeError(f"Scratch directory {cfg['scratch']} is not writable ({exc}); "
+                           "set scratch to a writable location") from None
+    for line in quota_lines([cfg["work"], cfg["scratch"]]):
+        log(f"  WARNING: {line}")
+
+
+def quota_lines(paths, threshold=85.0):
+    """Quotas above `threshold` percent for filesystems holding `paths`, from the
+    RCAC `myquota` command when it exists (rows: type, location, size, limit, use%)."""
+    if not shutil.which("myquota"):
+        return []
+    try:
+        out = subprocess.run(["myquota"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    warn = []
+    for line in out.splitlines():
+        parts = line.split()
+        pct = [float(x[:-1]) for x in parts if re.fullmatch(r"\d+(\.\d+)?%", x)]
+        if len(parts) < 2 or not pct or pct[0] < threshold:
+            continue
+        roots = {"home": [os.path.expanduser("~")],
+                 "scratch": [os.environ.get("RCAC_SCRATCH", "/scratch")],
+                 "depot": [f"/depot/{parts[1]}"]}.get(parts[0], [])
+        roots = [os.path.realpath(r) for r in roots]
+        if any(os.path.realpath(p) == r or os.path.realpath(p).startswith(r + os.sep)
+               for p in paths for r in roots):
+            warn.append(f"{parts[0]} {parts[1]} quota at {pct[0]:.0f}% "
+                        f"({parts[2]} of {parts[3]}); outputs may fail to write")
+    return warn
+
+
+def read_driver(work):
+    try:
+        with open(os.path.join(work, "driver.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_driver(work, info):
+    path = os.path.join(work, "driver.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(info, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def live_driver(work, poll):
+    """Description of another driver working on `work`, or None.
+
+    A driver submitted as a Slurm job counts as live while the job is queued or
+    running; one started by hand counts as live while its heartbeat is fresh."""
+    info = read_driver(work)
+    me = os.environ.get("SLURM_JOB_ID")
+    jobid = info.get("jobid")
+    if jobid and jobid != me and job_active(jobid):
+        return f"driver job {jobid}"
+    if (info.get("pid") and not (jobid and jobid == me) and info.get("pid") != os.getpid()
+            and time.time() - info.get("heartbeat", 0) < max(600, 5 * poll)):
+        return f"driver pid {info['pid']} on {info.get('host', '?')}"
+    return None
+
+
 class Workflow:
     def __init__(self, args):
         self.args = args
@@ -319,6 +418,15 @@ class Workflow:
         if os.path.exists(self.state_file):
             with open(self.state_file) as f:
                 self.state = json.load(f)
+
+    def heartbeat(self):
+        """Refresh <workdir>/driver.json so other invocations see a live driver."""
+        if self.args.dry_run:
+            return
+        info = read_driver(self.work)
+        info.update(pid=os.getpid(), host=socket.gethostname(), heartbeat=time.time(),
+                    jobid=os.environ.get("SLURM_JOB_ID") or info.get("jobid"))
+        write_driver(self.work, info)
 
     def save(self):
         with open(self.state_file + ".tmp", "w") as f:
@@ -342,9 +450,14 @@ class Workflow:
                 log(f"  {name}: job {ids[name]} still queued/running")
                 continue
             todo = [r for r, o in zip(runs, outs) if not output_done(o)]
-            ids[name] = submit(self.cfg, directory, name, todo, walltime)
-            self.save()
+            jobid = submit(self.cfg, directory, name, todo, walltime)
+            if jobid:
+                ids[name] = jobid
+                self.save()
+        if self.cfg.get("dry_run"):
+            raise DryRunStop(directory)
         while any(job_active(j) for j in ids.values()):
+            self.heartbeat()
             time.sleep(self.args.poll)
         bad = [os.path.join(directory, r[3]) for _, runs, _ in jobs for r in runs
                if not output_done(os.path.join(directory, r[3]))]
@@ -361,7 +474,19 @@ class Workflow:
         a = self.args
         pdir = os.path.join(self.work, "pseudo")
         os.makedirs(pdir, exist_ok=True)
-        pseudos = read_pseudos(os.path.abspath(a.pseudo_dir))
+        all_pseudos = read_pseudos(os.path.abspath(a.pseudo_dir))
+        if "input" in self.state:
+            elements = set(symbols_of(self.state["input"]["numbers"]))
+        else:
+            from ase.io import read
+            if not os.path.exists(a.structure):
+                raise FileNotFoundError(f"Structure file not found: {a.structure}")
+            atoms = read(a.structure)
+            elements = set(atoms.get_chemical_symbols())
+        missing = elements - set(all_pseudos)
+        if missing:
+            raise ValueError(f"No pseudopotential for {sorted(missing)} in {a.pseudo_dir}")
+        pseudos = {el: all_pseudos[el] for el in sorted(elements)}
         for info in pseudos.values():
             src = os.path.join(os.path.abspath(a.pseudo_dir), info["file"])
             dst = os.path.join(pdir, info["file"])
@@ -373,13 +498,10 @@ class Workflow:
             "qos": a.qos, "ntasks": a.ntasks, "modules": a.modules,
             "work": self.work,
             "scratch": default_scratch(a.scratch, self.work),
+            "dry_run": a.dry_run,
         }
+        preflight(self.cfg, pseudos, a)
         if "input" not in self.state:
-            from ase.io import read
-            atoms = read(a.structure)
-            missing = set(atoms.get_chemical_symbols()) - set(pseudos)
-            if missing:
-                raise ValueError(f"No pseudopotential for {sorted(missing)}")
             std = standardize(atoms.cell.array, atoms.get_scaled_positions(),
                               atoms.numbers, a.symprec)
             self.state["input"] = {"structure": os.path.abspath(a.structure),
@@ -395,7 +517,11 @@ class Workflow:
             ", ".join(f"{k}={v['file']} ({v['type']}, {v['functional']})"
                       for k, v in pseudos.items()))
         if types != {"NC"} and a.scan_dual < 8:
-            log("  WARNING: ultrasoft/PAW pseudos usually need ecutrho >= 8*ecutwfc")
+            log("  WARNING: ultrasoft/PAW pseudos usually need ecutrho >= 8*ecutwfc; "
+                "raise scan_dual")
+        functionals = {p["functional"] for p in pseudos.values()} - {"?"}
+        if len(functionals) > 1:
+            log(f"  WARNING: pseudopotentials use different functionals: {sorted(functionals)}")
         self.ref_dual = a.scan_dual
 
     def _npool(self, lattice, positions, numbers, mesh):
@@ -579,9 +705,10 @@ class Workflow:
             ids = self.state.setdefault("jobs", {}).setdefault("born", {})
             if not output_done(os.path.join(born_dir, "ph.out")) and not (
                     born_job[0] in ids and job_active(ids[born_job[0]])):
-                ids[born_job[0]] = submit(self.cfg, born_dir, born_job[0],
-                                          born_job[1], born_job[2])
-                self.save()
+                jobid = submit(self.cfg, born_dir, born_job[0], born_job[1], born_job[2])
+                if jobid:
+                    ids[born_job[0]] = jobid
+                    self.save()
         self.run_stage("disp", directory, jobs)
         if not a.metal:
             self.run_stage("born", born_dir, [born_job])
@@ -800,13 +927,26 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
 
 
 # ----------------------------------------------------------------------------
-def main():
-    p = argparse.ArgumentParser(description=__doc__,
+# Command line and config files
+# ----------------------------------------------------------------------------
+COMMANDS = ("run", "submit", "status", "init")
+PATH_KEYS = ("structure", "pseudo_dir", "workdir", "scratch")
+REQUIRED = ("name", "structure", "pseudo_dir")
+INTERNAL = {"help", "dry_run"}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="autophonon.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--name", required=True, help="compound name (used for prefixes/plots)")
-    p.add_argument("--structure", required=True, help="CIF / POSCAR / pw.x input / ...")
-    p.add_argument("--pseudo-dir", required=True, help="directory with one UPF per element")
-    p.add_argument("--workdir", help="output directory (default: <name>_auto)")
+    g = p.add_argument_group("required (here or in the config file)")
+    g.add_argument("--name", help="compound name (used for prefixes/plots)")
+    g.add_argument("--structure", help="CIF / POSCAR / pw.x input / ... (anything ASE reads)")
+    g.add_argument("--pseudo-dir", help="directory with one UPF per element")
+    g = p.add_argument_group("general")
+    g.add_argument("--workdir", help="output directory (default: <name>_auto next to the "
+                   "config file, or in the current directory)")
+    g.add_argument("--dry-run", action="store_true",
+                   help="write the next stage's inputs and job scripts, submit nothing")
     g = p.add_argument_group("convergence")
     g.add_argument("--ecutwfc-list", default="30:120:10", help="Ry, 'lo:hi:step' or 'a,b,c'")
     g.add_argument("--scan-dual", type=float, default=8,
@@ -846,6 +986,8 @@ def main():
     g.add_argument("--max-pools", type=int, default=4)
     g.add_argument("--walltime", default="04:00:00", help="convergence/relax/Born jobs")
     g.add_argument("--disp-walltime", default="08:00:00", help="each displacement job")
+    g.add_argument("--driver-walltime", default="3-00:00:00",
+                   help="driver job (it resubmits itself before this runs out)")
     g.add_argument("--modules", default="gcc/12.2.0 openmpi/4.1.4 quantum-espresso/7.1")
     g.add_argument("--scratch", help="QE outdir root (default: $RCAC_SCRATCH/autophonon/"
                    "<workdir name>, else <workdir>/tmp)")
@@ -854,9 +996,169 @@ def main():
     g.add_argument("--poll", type=int, default=60, help="seconds between queue checks")
     g.add_argument("--stop-after", choices=["ecutwfc", "ecutrho", "relax", "phonopy"],
                    help="stop after this stage")
-    args = p.parse_args()
+    return p
 
+
+def config_defaults(parser, path):
+    """Read a YAML config into parser defaults. Paths are relative to the file."""
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        parser.error(f"{path}: expected 'key: value' lines")
+    actions = {a.dest: a for a in parser._actions}
+    base = os.path.dirname(os.path.abspath(path))
+    out = {}
+    for key, value in data.items():
+        dest = str(key).replace("-", "_")
+        if dest not in actions or dest in INTERNAL:
+            valid = sorted(d for d in actions if d not in INTERNAL)
+            parser.error(f"{path}: unknown option '{key}'. Valid options:\n  " + ", ".join(valid))
+        act = actions[dest]
+        if value is None:
+            continue
+        if isinstance(act, argparse._StoreTrueAction):
+            value = bool(value)
+        elif isinstance(value, list):
+            value = ",".join(str(v) for v in value)
+        elif act.type is not None:
+            value = act.type(value)
+        else:
+            value = str(value)
+        if act.choices and value not in act.choices:
+            parser.error(f"{path}: {key} must be one of {list(act.choices)}")
+        if dest in PATH_KEYS:
+            value = os.path.join(base, os.path.expanduser(value))
+        out[dest] = value
+    if "workdir" not in out and out.get("name"):
+        out["workdir"] = os.path.join(base, f"{out['name']}_auto")
+    return out
+
+
+def parse_args(argv):
+    """[config.yaml] [--flags] -> argparse namespace (flags override the file)."""
+    parser = build_parser()
+    config = None
+    if argv and not argv[0].startswith("-"):
+        config = os.path.abspath(argv.pop(0))
+        if not os.path.isfile(config):
+            parser.error(f"config file not found: {config}")
+        parser.set_defaults(**config_defaults(parser, config))
+    args = parser.parse_args(argv)
+    missing = [k for k in REQUIRED if not getattr(args, k)]
+    if missing:
+        parser.error("missing " + ", ".join(m.replace("_", "-") for m in missing) +
+                     " (give them in the config file or as --flags)")
+    args.config = config
+    return args
+
+
+def resolved_config(args):
+    """Every option with absolute paths, as written to <workdir>/autophonon.yaml."""
+    out = {}
+    for act in build_parser()._actions:
+        if act.dest in INTERNAL:
+            continue
+        value = getattr(args, act.dest)
+        if act.dest in PATH_KEYS and value:
+            value = os.path.abspath(value)
+        out[act.dest] = value
+    out["workdir"] = os.path.abspath(args.workdir or f"{args.name}_auto")
+    return out
+
+
+def driver_script(args, work, config):
+    script = os.path.abspath(__file__)
+    lines = ["#!/bin/bash",
+             f"#SBATCH --job-name={args.name}_driver",
+             f"#SBATCH --account={args.account}",
+             f"#SBATCH --partition={args.partition}",
+             f"#SBATCH --qos={args.qos}",
+             "#SBATCH --nodes=1",
+             "#SBATCH --ntasks=1",
+             "#SBATCH --mem=1G",
+             f"#SBATCH --time={args.driver_walltime}",
+             # USR1 to the batch shell (exec'd into python) 10 min before the end
+             "#SBATCH --signal=B:USR1@600",
+             f"#SBATCH --output={os.path.join(work, 'driver.log')}",
+             "#SBATCH --open-mode=append",
+             "",
+             f'cd "{work}"',
+             "export PYTHONUNBUFFERED=1",
+             f'exec "{sys.executable}" "{script}" run "{config}"']
+    return "\n".join(lines) + "\n"
+
+
+def cmd_submit(args):
+    import yaml
+    work = os.path.abspath(args.workdir or f"{args.name}_auto")
+    os.makedirs(work, exist_ok=True)
+    other = live_driver(work, args.poll)
+    if other:
+        sys.exit(f"{work} already has a {other}; see `autophonon.py status {work}`")
+    config = os.path.join(work, "autophonon.yaml")
+    with open(config, "w") as f:
+        f.write("# Resolved options for this run (written by `autophonon.py submit`)\n")
+        yaml.safe_dump(resolved_config(args), f, sort_keys=False)
+    path = os.path.join(work, "driver.slurm")
+    with open(path, "w") as f:
+        f.write(driver_script(args, work, config))
+    if args.dry_run:
+        print(f"Dry run: wrote {config} and {path}; not submitted.\n")
+        print(open(path).read())
+        return
+    out = subprocess.run(["sbatch", "--parsable", path], cwd=work,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"sbatch failed: {out.stderr.strip()}")
+    jobid = out.stdout.strip().split(";")[0]
+    write_driver(work, {"jobid": jobid, "submitted": time.time()})
+    print(f"Submitted driver job {jobid} for {args.name}")
+    print(f"  workdir: {work}")
+    print(f"  log:     {os.path.join(work, 'driver.log')}")
+    print(f"  check:   python {os.path.abspath(__file__)} status {work}")
+
+
+def resubmit_driver(work):
+    path = os.path.join(work, "driver.slurm")
+    out = subprocess.run(["sbatch", "--parsable", path], cwd=work,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        log(f"Could not resubmit the driver ({out.stderr.strip()}); "
+            f"run `sbatch {path}` to continue")
+        return
+    jobid = out.stdout.strip().split(";")[0]
+    write_driver(work, {"jobid": jobid, "submitted": time.time()})
+    log(f"Driver walltime nearly used up; resubmitted as job {jobid}")
+
+
+def cmd_run(args):
     wf = Workflow(args)
+    if not args.dry_run:
+        other = live_driver(wf.work, args.poll)
+        if other:
+            sys.exit(f"{wf.work} already has a {other}; see `autophonon.py status {wf.work}`")
+        wf.heartbeat()
+    in_slurm_driver = (os.environ.get("SLURM_JOB_ID")
+                       and os.path.exists(os.path.join(wf.work, "driver.slurm")))
+    if in_slurm_driver and not args.dry_run:
+        def on_usr1(signum, frame):
+            raise WalltimeSignal()
+        signal.signal(signal.SIGUSR1, on_usr1)
+    try:
+        pipeline(wf, args)
+    except DryRunStop as stop:
+        log(f"Dry run finished: inputs and job scripts are in {stop.args[0]}")
+    except WalltimeSignal:
+        resubmit_driver(wf.work)
+        return
+    if not args.dry_run:
+        info = read_driver(wf.work)
+        info.update(heartbeat=0, finished=time.time())
+        write_driver(wf.work, info)
+
+
+def pipeline(wf, args):
     wf.setup()
     wf.convergence("ecutwfc")
     if args.stop_after == "ecutwfc":
@@ -882,6 +1184,139 @@ def main():
     print(f"  Gamma frequencies (cm^-1): {summary['gamma_cm1']}")
     if summary["min_freq_cm1"] < -5:
         print(f"  WARNING: imaginary modes down to {summary['min_freq_cm1']:.1f} cm^-1")
+
+
+def cmd_status(argv):
+    if not argv or argv[0].startswith("-"):
+        sys.exit("usage: autophonon.py status <config.yaml | workdir>")
+    target = os.path.abspath(argv[0])
+    work = target if os.path.isdir(target) else os.path.abspath(
+        parse_args(list(argv)).workdir)
+    state_file = os.path.join(work, "state.json")
+    if not os.path.exists(state_file):
+        sys.exit(f"No state.json in {work}; nothing has run there yet")
+    with open(state_file) as f:
+        state = json.load(f)
+    res = state.get("results", {})
+    print(f"Workdir: {work}")
+
+    info = read_driver(work)
+    if "summary" in res and not (info.get("jobid") and job_active(info["jobid"])):
+        print("Driver:  finished")
+    elif info.get("finished"):
+        print(f"Driver:  finished {time.strftime('%Y-%m-%d %H:%M', time.localtime(info['finished']))}")
+    elif info.get("jobid") and job_active(info["jobid"]):
+        age = time.time() - info.get("heartbeat", 0)
+        seen = f", last heartbeat {age / 60:.0f} min ago" if info.get("heartbeat") else ", queued"
+        print(f"Driver:  Slurm job {info['jobid']}{seen}")
+    elif info.get("pid") and time.time() - info.get("heartbeat", 0) < 600:
+        print(f"Driver:  pid {info['pid']} on {info.get('host', '?')}")
+    else:
+        print("Driver:  not running (resubmit with `autophonon.py submit <config>` "
+              "to continue)")
+
+    inp = state.get("input", {})
+    if inp:
+        print(f"Input:   {inp['spacegroup']}, {len(inp['numbers'])} atoms in primitive cell")
+    print(f"ecutwfc: {res['conv_ecutwfc']:g} Ry" if "conv_ecutwfc" in res else "ecutwfc: pending")
+    print(f"ecutrho: {res['conv_ecutrho']:g} Ry" if "conv_ecutrho" in res else "ecutrho: pending")
+    if "relaxed" in res:
+        r = res["relaxed"]
+        abc = ", ".join(f"{np.linalg.norm(v):.4f}" for v in r["conv_lattice"])
+        print(f"relax:   {r['spacegroup']}, a,b,c = {abc} A, P = {r['pressure']:.2f} kbar")
+    else:
+        print("relax:   pending")
+    pdir = os.path.join(work, "04_phonopy")
+    disp = sorted(glob.glob(os.path.join(pdir, "disp-*.in")))
+    if disp:
+        done = sum(output_done(d[:-3] + ".out") for d in disp)
+        born = os.path.join(pdir, "born", "ph.out")
+        extra = (", Born charges " + ("done" if output_done(born) else "pending")
+                 if os.path.exists(os.path.join(pdir, "born")) else "")
+        print(f"phonons: {done}/{len(disp)} displacements done{extra}")
+    else:
+        print("phonons: pending")
+    if "summary" in res:
+        sm = res["summary"]
+        print(f"result:  Gamma (cm^-1) {sm['gamma_cm1']}; lowest frequency "
+              f"{sm['min_freq_cm1']:.1f} cm^-1")
+        pngs = glob.glob(os.path.join(work, "*_phonons.png"))
+        if pngs:
+            print(f"plot:    {pngs[0]}")
+
+    ids = sorted({j for stage in state.get("jobs", {}).values() for j in stage.values()})
+    if ids:
+        out = subprocess.run(["squeue", "-h", "-j", ",".join(ids), "-o", "%i  %j  %T  %M"],
+                             capture_output=True, text=True)
+        rows = [l for l in out.stdout.splitlines() if l.strip()]
+        if rows:
+            print("Jobs in queue:")
+            for row in rows:
+                print("  " + row)
+    log_file = os.path.join(work, "driver.log")
+    if os.path.exists(log_file):
+        with open(log_file, errors="ignore") as f:
+            tail = f.read().splitlines()[-5:]
+        print("Recent driver.log:")
+        for line in tail:
+            print("  " + line)
+
+
+def cmd_init(argv):
+    import yaml
+    parser = build_parser()
+    parser.add_argument("-o", "--output", help="config file to write (default: <name>.yaml)")
+    args = parser.parse_args(argv)
+    missing = [k for k in REQUIRED if not getattr(args, k)]
+    if missing:
+        parser.error("init needs " + ", ".join("--" + m.replace("_", "-") for m in REQUIRED))
+    out = os.path.abspath(args.output or f"{args.name}.yaml")
+    if os.path.exists(out):
+        sys.exit(f"{out} exists; remove it or pass -o")
+    base = os.path.dirname(out)
+
+    def rel(path):
+        r = os.path.relpath(os.path.abspath(path), base)
+        return os.path.abspath(path) if r.startswith("..") else r
+
+    def show(v):
+        return yaml.safe_dump(v, default_flow_style=True).strip().removesuffix("...").strip()
+
+    lines = [f"# autophonon configuration for {args.name}",
+             "# Paths are relative to this file. Uncomment a line to change its default.",
+             f"# Start:  python {os.path.abspath(__file__)} submit {os.path.basename(out)}",
+             "",
+             f"name: {show(args.name)}",
+             f"structure: {show(rel(args.structure))}",
+             f"pseudo_dir: {show(rel(args.pseudo_dir))}"]
+    for group in parser._action_groups:
+        acts = [a for a in group._group_actions
+                if a.dest not in INTERNAL and a.dest not in REQUIRED and a.dest != "output"]
+        if not acts:
+            continue
+        lines += ["", f"# --- {group.title} ---"]
+        for a in acts:
+            value = getattr(args, a.dest)
+            key = f"{a.dest}: {show(value)}"
+            comment = f"  # {a.help}" if a.help else ""
+            lines.append(("" if value != a.default else "# ") + key + comment)
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Wrote {out}")
+    print(f"Review it, then: python {os.path.abspath(__file__)} submit {out}")
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv.pop(0) if argv and argv[0] in COMMANDS else "run"
+    if cmd == "status":
+        return cmd_status(argv)
+    if cmd == "init":
+        return cmd_init(argv)
+    args = parse_args(argv)
+    if cmd == "submit":
+        return cmd_submit(args)
+    return cmd_run(args)
 
 
 if __name__ == "__main__":
