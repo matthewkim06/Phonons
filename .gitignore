@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Calculation outputs and manual runs (not part of the tool)
+auto_test/
+phonopy/
+relax/
+ecut_conv/
+*_auto/
+*_auto.log
+tmp/
+
+# Third-party pseudopotentials: users download their own
+pseudo/
+*.upf
+*.UPF
