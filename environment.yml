@@ -1,0 +1,16 @@
+# Python environment for autophonon.py (Quantum ESPRESSO itself comes from
+# the cluster module, see README).  Create with:
+#   module load anaconda
+#   conda env create -f environment.yml
+name: autophonon
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - numpy
+  - phonopy>=2.20
+  - seekpath
+  - spglib
+  - ase
+  - matplotlib
+  - pyyaml
