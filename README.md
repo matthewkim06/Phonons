@@ -20,8 +20,8 @@ finished calculations are kept.
 ## Setup (once)
 
 ```bash
-git clone git@github.com:<owner>/autophonon.git
-cd autophonon
+git clone git@github.com:matthewkim06/Phonons.git
+cd Phonons
 module load anaconda
 conda env create -f environment.yml      # creates the "autophonon" env
 ```
@@ -49,7 +49,7 @@ higher, since they need a larger ecutrho/ecutwfc ratio.
 
 ```bash
 conda activate autophonon
-AP=~/autophonon/autophonon.py          # wherever you cloned it
+AP=~/Phonons/autophonon.py             # wherever you cloned it
 
 # 1. Write a config file (every option listed with its default, commented out)
 python $AP init --name NaCl --structure NaCl.cif --pseudo-dir ~/pseudo/dojo-pbe
@@ -131,9 +131,13 @@ limit, so long phonon runs need no babysitting.
 | System | Notes | Status |
 |---|---|---|
 | NaCl | ionic, LO–TO; ecutwfc 80 / ecutrho 640 Ry, a = 5.688 Å, TO 159 / LO 251 cm⁻¹ at Γ (PBE) | done |
-| Si | covalent | running |
-| Al | metal | running |
-| GaN (wurtzite) | polar, hexagonal, anisotropic Z* | running |
+| Si | covalent, non-polar; 30 / 120 Ry, a = 5.468 Å, Γ optical 504 cm⁻¹, TA(X) 147, TA(L) 112 cm⁻¹ | done |
+| Al | metal; 40 / 160 Ry, a = 4.038 Å, X: LA 323, TA 191 cm⁻¹ (expt. 323, 193) | done |
+| GaN (wurtzite) | polar, hexagonal; 80 / 320 Ry, a = 3.219, c = 5.244 Å, Z*(Ga) = 2.65 (⊥c) / 2.79 (∥c), E2(low) 136, A1(TO) 503, E1(TO) 526 cm⁻¹; ~3 h per 128-atom displacement job | done |
+
+All PBE with the PseudoDojo set above. Inputs and outputs are on Negishi in
+`~kim5249/NaCL_Phonons/validation/runs/` (Si, Al, GaN) and
+`~kim5249/NaCL_Phonons/auto_test/NaCl_auto_v2/` (NaCl).
 
 ## Changing the code
 

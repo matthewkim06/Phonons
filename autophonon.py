@@ -570,6 +570,9 @@ class Workflow:
         if chosen == values[-2]:
             log(f"  WARNING: {kind}={chosen} is the second-highest value tested; "
                 "the range may be too small.")
+        elif chosen == values[0]:
+            log(f"  NOTE: {kind}={chosen} is the lowest value tested; a lower value "
+                "might also pass (only matters for cost).")
         result = chosen if kind == "ecutwfc" else chosen * self.state["results"]["conv_ecutwfc"]
         log(f"  converged {kind} = {result:g} Ry")
         self.state.setdefault("results", {})[key] = result
@@ -722,9 +725,23 @@ class Workflow:
         if not a.metal:
             r = subprocess.run([os.path.join(bindir, "phonopy-qe-born"), "scf.in", "ph.out"],
                                cwd=born_dir, check=True, capture_output=True, text=True)
-            with open(os.path.join(directory, "BORN"), "w") as f:
-                f.write(r.stdout)
-        log("  FORCE_SETS" + ("" if a.metal else " and BORN") + " written")
+            born_text = r.stdout
+            # Lines 3+ of BORN are the Z* tensors; all ~0 for non-polar crystals (Si)
+            zstar = np.array([[float(x) for x in l.split()]
+                              for l in born_text.splitlines()[2:] if l.strip()])
+            born_path = os.path.join(directory, "BORN")
+            if zstar.size and np.abs(zstar).max() < 0.05:
+                with open(os.path.join(born_dir, "BORN"), "w") as f:
+                    f.write(born_text)
+                if os.path.exists(born_path):
+                    os.remove(born_path)
+                log("  Born charges are ~0 (non-polar crystal): no LO-TO correction; "
+                    "values kept in born/BORN")
+            else:
+                with open(born_path, "w") as f:
+                    f.write(born_text)
+                log("  BORN written")
+        log("  FORCE_SETS written")
         return directory
 
     # ------------------------------------------------------------------
@@ -904,8 +921,9 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
                   frameon=False)
 
     axd.plot(tdos, e_dos, color="k", lw=1.2, label="total")
-    for j, el in enumerate(elements):
-        axd.plot(pdos[el], e_dos, color=SERIES[j % len(SERIES)], lw=1.2, label=el)
+    if len(elements) > 1:          # one element: the projection equals the total
+        for j, el in enumerate(elements):
+            axd.plot(pdos[el], e_dos, color=SERIES[j % len(SERIES)], lw=1.2, label=el)
     axd.set_xlim(0, tdos.max() * 1.1)
     axd.set_xticks([])
     axd.set_xlabel("DOS")
