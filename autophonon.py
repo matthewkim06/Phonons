@@ -342,7 +342,7 @@ def capped_walltime(walltime, qos):
 
 def job_script(cfg, name, runs, walltime, outdir):
     """runs: list of (executable, npool, input, output) executed in order."""
-    lines = ["#!/bin/bash",
+    lines = ["#!/bin/bash -l",
              f"#SBATCH --job-name={name}",
              f"#SBATCH --account={cfg['account']}",
              f"#SBATCH --partition={cfg['partition']}",
@@ -1275,7 +1275,7 @@ def resolved_config(args):
 
 def driver_script(args, work, config):
     script = os.path.abspath(__file__)
-    lines = ["#!/bin/bash",
+    lines = ["#!/bin/bash -l",
              f"#SBATCH --job-name={args.name}_driver",
              f"#SBATCH --account={args.account}",
              f"#SBATCH --partition={args.partition}",
