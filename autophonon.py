@@ -304,6 +304,42 @@ def parse_final_coordinates(block):
 # ----------------------------------------------------------------------------
 # Slurm
 # ----------------------------------------------------------------------------
+def walltime_seconds(text):
+    """'D-HH:MM:SS', 'HH:MM:SS' or 'MM:SS' -> seconds."""
+    days, _, hms = text.rpartition("-")
+    parts = [int(x) for x in hms.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+_QOS_MAXWALL = {}
+
+
+def qos_maxwall(qos):
+    """Walltime limit of a Slurm QOS in seconds (None if unlimited/unknown)."""
+    if qos not in _QOS_MAXWALL:
+        limit = None
+        try:
+            out = subprocess.run(["sacctmgr", "-nP", "show", "qos", qos, "format=maxwall"],
+                                 capture_output=True, text=True, timeout=60).stdout.strip()
+            if out:
+                limit = walltime_seconds(out.splitlines()[0])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        _QOS_MAXWALL[qos] = limit
+    return _QOS_MAXWALL[qos]
+
+
+def capped_walltime(walltime, qos):
+    """Walltime shortened to the QOS limit (e.g. 4 h on standby)."""
+    limit = qos_maxwall(qos)
+    if limit and walltime_seconds(walltime) > limit:
+        h, m = divmod(limit // 60, 60)
+        return f"{h:02d}:{m:02d}:00"
+    return walltime
+
+
 def job_script(cfg, name, runs, walltime, outdir):
     """runs: list of (executable, npool, input, output) executed in order."""
     lines = ["#!/bin/bash",
@@ -342,8 +378,11 @@ class WalltimeSignal(Exception):
 def submit(cfg, directory, name, runs, walltime):
     """Write <name>.slurm and sbatch it. Returns the job id (None in a dry run)."""
     path = os.path.join(directory, f"{name}.slurm")
+    capped = capped_walltime(walltime, cfg["qos"])
+    if capped != walltime:
+        log(f"  {name}: walltime {walltime} capped to {capped} (qos {cfg['qos']} limit)")
     with open(path, "w") as f:
-        f.write(job_script(cfg, name, runs, walltime, scratch_dir(cfg, directory)))
+        f.write(job_script(cfg, name, runs, capped, scratch_dir(cfg, directory)))
     if cfg.get("dry_run"):
         log(f"  dry run: wrote {os.path.relpath(path, cfg['work'])} (not submitted)")
         return None
@@ -367,6 +406,21 @@ def job_active(jobid, retries=5):
             return False
         time.sleep(30 * (attempt + 1))
     raise RuntimeError(f"squeue keeps failing for job {jobid}: {out.stderr.strip()}")
+
+
+def job_state(jobid):
+    """Final Slurm state of a job (e.g. COMPLETED, TIMEOUT, NODE_FAIL), or ''."""
+    try:
+        out = subprocess.run(["sacct", "-n", "-X", "-P", "-j", jobid, "-o", "State"],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    return lines[-1].split()[0] if lines else ""
+
+
+# Failures that are the cluster's fault, so resubmitting is worth it
+RETRY_STATES = {"NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "REQUEUED"}
 
 
 def default_scratch(requested, work):
@@ -504,6 +558,22 @@ class Workflow:
         while any(job_active(j) for j in ids.values()):
             self.heartbeat()
             time.sleep(self.args.poll)
+        # Resubmit jobs lost to node failure/preemption (not ones that ran out
+        # of time or crashed: rerunning those would fail the same way)
+        retries = self.state.setdefault("retries", {})
+        again = []
+        for name, runs, walltime in jobs:
+            if all(output_done(os.path.join(directory, r[3])) for r in runs) or name not in ids:
+                continue
+            state = job_state(ids[name])
+            if state in RETRY_STATES and retries.get(name, 0) < 2:
+                retries[name] = retries.get(name, 0) + 1
+                log(f"  {name}: job {ids[name]} ended {state}; resubmitting "
+                    f"(retry {retries[name]} of 2)")
+                again.append((name, runs, walltime))
+        if again:
+            self.save()
+            return self.run_stage(key, directory, jobs)
         bad = [os.path.join(directory, r[3]) for _, runs, _ in jobs for r in runs
                if not output_done(os.path.join(directory, r[3]))]
         if bad:
@@ -1100,11 +1170,16 @@ def build_parser():
     g = p.add_argument_group("slurm")
     g.add_argument("--account", default="strachan")
     g.add_argument("--partition", default="cpu")
-    g.add_argument("--qos", default="normal")
+    g.add_argument("--qos", default="normal",
+                   help="QOS for the compute jobs; 'standby' uses idle nodes outside the "
+                   "group allocation (4 h limit per job; walltimes are capped to it)")
     g.add_argument("--ntasks", type=int, default=32)
     g.add_argument("--max-pools", type=int, default=4)
     g.add_argument("--walltime", default="04:00:00", help="convergence/relax/Born jobs")
     g.add_argument("--disp-walltime", default="08:00:00", help="each displacement job")
+    g.add_argument("--driver-qos", default="normal",
+                   help="QOS for the 1-core driver job (keep a QOS without a short "
+                   "walltime limit, even when qos: standby is used for the compute jobs)")
     g.add_argument("--driver-walltime", default="3-00:00:00",
                    help="driver job (it resubmits itself before this runs out)")
     g.add_argument("--modules", default="gcc/12.2.0 openmpi/4.1.4 quantum-espresso/7.1")
@@ -1202,7 +1277,7 @@ def driver_script(args, work, config):
              f"#SBATCH --job-name={args.name}_driver",
              f"#SBATCH --account={args.account}",
              f"#SBATCH --partition={args.partition}",
-             f"#SBATCH --qos={args.qos}",
+             f"#SBATCH --qos={args.driver_qos}",
              "#SBATCH --nodes=1",
              "#SBATCH --ntasks=1",
              "#SBATCH --mem=1G",
