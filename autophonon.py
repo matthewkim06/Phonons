@@ -501,7 +501,9 @@ def live_driver(work, poll):
     jobid = info.get("jobid")
     if jobid and jobid != me and job_active(jobid):
         return f"driver job {jobid}"
-    if (info.get("pid") and not (jobid and jobid == me) and info.get("pid") != os.getpid()
+    # A driver that ran as a Slurm job is dead once its job is gone; the
+    # heartbeat only matters for drivers started by hand (no job id)
+    if (info.get("pid") and not jobid and info.get("pid") != os.getpid()
             and time.time() - info.get("heartbeat", 0) < max(600, 5 * poll)):
         return f"driver pid {info['pid']} on {info.get('host', '?')}"
     return None
