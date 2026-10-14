@@ -670,6 +670,12 @@ class Workflow:
         a, key = self.args, f"conv_{kind}"
         if key in self.state.get("results", {}):
             return self.state["results"][key]
+        given = getattr(a, kind)
+        if given:
+            log(f"Stage: {kind} = {given:g} Ry given; skipping the scan")
+            self.state.setdefault("results", {})[key] = float(given)
+            self.save()
+            return float(given)
         inp = self.state["input"]
         # Rattled supercell: atoms move independently of their periodic images,
         # so the force check probes the same couplings the phonon runs need.
@@ -697,7 +703,12 @@ class Workflow:
                 f.write(pw_input("scf", tag, lat, pos, syms, ew, er, mesh, self.cfg,
                                  scratch_dir(self.cfg, directory), extra_control="  disk_io     = 'none'\n"))
             runs.append(("pw.x", npool, tag + ".in", tag + ".out"))
-        self.run_stage(key, directory, [(f"{a.name}_{kind}", runs, a.walltime)])
+        parallel = a.scan_parallel if a.scan_parallel is not None else a.qos == "standby"
+        if parallel:      # one job per cutoff: done in the time of the slowest
+            jobs = [(f"{a.name}_{kind}_{v:g}", [r], a.walltime) for v, r in zip(values, runs)]
+        else:             # one job running them in turn (gentler on a group allocation)
+            jobs = [(f"{a.name}_{kind}", runs, a.walltime)]
+        self.run_stage(key, directory, jobs)
 
         data = [parse_pw(os.path.join(directory, r[3])) for r in runs]
         chosen, table = pick_converged(values, data, a.etol, a.ptol, a.ftol)
@@ -1146,6 +1157,14 @@ def build_parser():
                    help="random displacement (Angstrom) applied for the cutoff scans")
     g.add_argument("--conv-supercell", type=int, default=2,
                    help="n for the n x n x n primitive-cell supercell used in the cutoff scans")
+    g.add_argument("--ecutwfc", type=float,
+                   help="use this wavefunction cutoff (Ry) and skip its scan; cutoffs "
+                   "depend on the pseudopotentials, so reuse them across structures")
+    g.add_argument("--ecutrho", type=float,
+                   help="use this density cutoff (Ry) and skip its scan")
+    g.add_argument("--scan-parallel", type=lambda v: str(v).lower() in ("1", "true", "yes"),
+                   help="run each cutoff of a scan as its own job (default: yes with "
+                   "qos standby, no otherwise)")
     g.add_argument("--kspacing", type=float, default=0.25,
                    help="k-point spacing in 1/Angstrom (2*pi included)")
     g = p.add_argument_group("relaxation / phonons")
