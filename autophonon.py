@@ -15,21 +15,20 @@ Each stage is submitted to Slurm and the driver waits for it. Progress is kept
 in <workdir>/state.json and finished outputs are never recomputed, so a run
 can be stopped and restarted at any point.
 
-Usage:
-  autophonon.py init --name Si --structure Si.cif --pseudo-dir pseudo
-        write Si.yaml listing every option and its default
-  autophonon.py submit Si.yaml [--dry-run]
-        start the driver as a 1-core Slurm job (it resubmits itself if it
-        runs out of walltime); output goes to <workdir>/driver.log
-  autophonon.py status Si.yaml|<workdir>
-        stages done, jobs in the queue, recent log lines
-  autophonon.py run Si.yaml [--dry-run]
-        run the driver in the foreground (what the driver job executes);
-        --dry-run writes the next stage's inputs and job scripts without
-        submitting them
+Usage (with the `autophonon` wrapper on your PATH; otherwise
+`python autophonon.py ...`):
 
-Options can also be given as flags (they override the config file), e.g.
-  autophonon.py run --name NaCl --structure NaCl.cif --pseudo-dir pseudo
+  autophonon start GaAs.cif                 structure file
+  autophonon start GaAs:zincblende:5.653    or built: Formula:structure:a[:c]
+  autophonon start Al:fcc:4.05 --metal      any option as a flag
+        writes <name>.yaml (if missing) and submits the driver job
+  autophonon status                         progress of the run in this folder
+  autophonon start GaAs.yaml                resubmit after a change or failure
+
+  Lower level: init (write a config only), submit <config>, run <config>
+  [--dry-run] (foreground driver; --dry-run writes the next stage's inputs
+  without submitting). Pseudopotentials default to $AUTOPHONON_PSEUDO_DIR,
+  else ~/pseudo/dojo-pbe.
 """
 import argparse
 import glob
@@ -1044,7 +1043,7 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
 # ----------------------------------------------------------------------------
 # Command line and config files
 # ----------------------------------------------------------------------------
-COMMANDS = ("run", "submit", "status", "init")
+COMMANDS = ("start", "run", "submit", "status", "init")
 PATH_KEYS = ("structure", "pseudo_dir", "workdir", "scratch", "born_file")
 REQUIRED = ("name", "structure", "pseudo_dir")
 INTERNAL = {"help", "dry_run"}
@@ -1155,6 +1154,14 @@ def config_defaults(parser, path):
     return out
 
 
+def default_pseudo_dir():
+    env = os.environ.get("AUTOPHONON_PSEUDO_DIR")
+    if env:
+        return os.path.expanduser(env)
+    home = os.path.expanduser("~/pseudo/dojo-pbe")
+    return home if os.path.isdir(home) else None
+
+
 def parse_args(argv):
     """[config.yaml] [--flags] -> argparse namespace (flags override the file)."""
     parser = build_parser()
@@ -1165,6 +1172,8 @@ def parse_args(argv):
             parser.error(f"config file not found: {config}")
         parser.set_defaults(**config_defaults(parser, config))
     args = parser.parse_args(argv)
+    if not args.pseudo_dir:
+        args.pseudo_dir = default_pseudo_dir()
     missing = [k for k in REQUIRED if not getattr(args, k)]
     if missing:
         parser.error("missing " + ", ".join(m.replace("_", "-") for m in missing) +
@@ -1215,10 +1224,10 @@ def cmd_submit(args):
     os.makedirs(work, exist_ok=True)
     other = live_driver(work, args.poll)
     if other:
-        sys.exit(f"{work} already has a {other}; see `autophonon.py status {work}`")
+        sys.exit(f"{work} already has a {other}; see `autophonon status`")
     config = os.path.join(work, "autophonon.yaml")
     with open(config, "w") as f:
-        f.write("# Resolved options for this run (written by `autophonon.py submit`)\n")
+        f.write("# Resolved options for this run (written by `autophonon start/submit`)\n")
         yaml.safe_dump(resolved_config(args), f, sort_keys=False)
     path = os.path.join(work, "driver.slurm")
     with open(path, "w") as f:
@@ -1236,7 +1245,7 @@ def cmd_submit(args):
     print(f"Submitted driver job {jobid} for {args.name}")
     print(f"  workdir: {work}")
     print(f"  log:     {os.path.join(work, 'driver.log')}")
-    print(f"  check:   python {os.path.abspath(__file__)} status {work}")
+    print(f"  check:   autophonon status   (in {os.path.dirname(work)})")
 
 
 def resubmit_driver(work):
@@ -1257,7 +1266,7 @@ def cmd_run(args):
     if not args.dry_run:
         other = live_driver(wf.work, args.poll)
         if other:
-            sys.exit(f"{wf.work} already has a {other}; see `autophonon.py status {wf.work}`")
+            sys.exit(f"{wf.work} already has a {other}; see `autophonon status`")
         wf.heartbeat()
     in_slurm_driver = (os.environ.get("SLURM_JOB_ID")
                        and os.path.exists(os.path.join(wf.work, "driver.slurm")))
@@ -1312,14 +1321,35 @@ def pipeline(wf, args):
         print(f"  WARNING: imaginary modes down to {summary['min_freq_cm1']:.1f} cm^-1")
 
 
+def find_run(directory="."):
+    """The single run (workdir with state.json) in or below `directory`."""
+    d = os.path.abspath(directory)
+    marks = ("state.json", "driver.json")
+    if any(os.path.exists(os.path.join(d, m)) for m in marks):
+        return d
+    found = sorted({os.path.dirname(f) for m in marks
+                    for f in glob.glob(os.path.join(d, "*", m))})
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        sys.exit("No run in this folder; give a config file or workdir, "
+                 "e.g. `autophonon status GaAs.yaml`")
+    sys.exit("Several runs here; pick one:\n  " + "\n  ".join(
+        os.path.relpath(f) for f in found))
+
+
 def cmd_status(argv):
     if not argv or argv[0].startswith("-"):
-        sys.exit("usage: autophonon.py status <config.yaml | workdir>")
+        argv = [find_run()]
     target = os.path.abspath(argv[0])
     work = target if os.path.isdir(target) else os.path.abspath(
         parse_args(list(argv)).workdir)
     state_file = os.path.join(work, "state.json")
     if not os.path.exists(state_file):
+        info = read_driver(work)
+        if info.get("jobid") and job_active(info["jobid"]):
+            sys.exit(f"Workdir: {work}\nDriver:  Slurm job {info['jobid']} is queued; "
+                     "nothing has run yet")
         sys.exit(f"No state.json in {work}; nothing has run there yet")
     with open(state_file) as f:
         state = json.load(f)
@@ -1338,8 +1368,7 @@ def cmd_status(argv):
     elif info.get("pid") and time.time() - info.get("heartbeat", 0) < 600:
         print(f"Driver:  pid {info['pid']} on {info.get('host', '?')}")
     else:
-        print("Driver:  not running (resubmit with `autophonon.py submit <config>` "
-              "to continue)")
+        print("Driver:  not running (`autophonon start <name>.yaml` continues it)")
 
     inp = state.get("input", {})
     if inp:
@@ -1395,11 +1424,63 @@ def cmd_status(argv):
             print("  " + line)
 
 
+def build_structure(spec):
+    """'GaAs:zincblende:5.653' or 'GaN:wurtzite:3.19:5.19' -> CIF path."""
+    from ase.build import bulk
+    parts = spec.split(":")
+    if len(parts) not in (3, 4):
+        sys.exit(f"'{spec}' is neither a file nor Formula:structure:a[:c] "
+                 "(e.g. GaAs:zincblende:5.653, Al:fcc:4.05, GaN:wurtzite:3.19:5.19)")
+    formula, kind = parts[0], parts[1]
+    try:
+        lengths = [float(x) for x in parts[2:]]
+        atoms = bulk(formula, kind, a=lengths[0], c=lengths[1] if len(lengths) > 1 else None)
+    except Exception as exc:
+        sys.exit(f"Could not build {spec}: {exc}\nStructures ASE knows: sc, fcc, bcc, "
+                 "hcp, diamond, zincblende, rocksalt, cesiumchloride, fluorite, wurtzite")
+    path = os.path.abspath(f"{formula}.cif")
+    if os.path.exists(path):
+        sys.exit(f"{path} already exists; use `autophonon start {formula}.cif`")
+    atoms.write(path)
+    print(f"Built {kind} {formula} -> {os.path.basename(path)}")
+    return path
+
+
+def cmd_start(argv):
+    """One step: structure (file or spec) or config -> config + submitted driver."""
+    if not argv or argv[0].startswith("-"):
+        sys.exit("usage: autophonon start <structure file | Formula:structure:a | config.yaml> "
+                 "[--option value ...]")
+    target, flags = argv[0], argv[1:]
+    if target.endswith((".yaml", ".yml")):
+        return cmd_submit(parse_args([target] + flags))
+    if not os.path.exists(target):
+        formula = target.split(":")[0]
+        if ":" in target and os.path.exists(f"{formula}.yaml"):
+            print(f"Using existing {formula}.yaml (edit it to change options)")
+            return cmd_submit(parse_args([f"{formula}.yaml"] + flags))
+        target = build_structure(target)
+    name = os.path.splitext(os.path.basename(target))[0]
+    if "--name" in flags:
+        name = flags[flags.index("--name") + 1]
+    config = os.path.abspath(f"{name}.yaml")
+    if os.path.exists(config):
+        print(f"Using existing {os.path.basename(config)} (edit it to change options)")
+        return cmd_submit(parse_args([config] + flags))
+    init_flags = [f for f in flags if f != "--dry-run"]
+    if "--name" not in init_flags:
+        init_flags += ["--name", name]
+    cmd_init(init_flags + ["--structure", target, "-o", config])
+    return cmd_submit(parse_args([config] + (["--dry-run"] if "--dry-run" in flags else [])))
+
+
 def cmd_init(argv):
     import yaml
     parser = build_parser()
     parser.add_argument("-o", "--output", help="config file to write (default: <name>.yaml)")
     args = parser.parse_args(argv)
+    if not args.pseudo_dir:
+        args.pseudo_dir = default_pseudo_dir()
     missing = [k for k in REQUIRED if not getattr(args, k)]
     if missing:
         parser.error("init needs " + ", ".join("--" + m.replace("_", "-") for m in REQUIRED))
@@ -1417,7 +1498,7 @@ def cmd_init(argv):
 
     lines = [f"# autophonon configuration for {args.name}",
              "# Paths are relative to this file. Uncomment a line to change its default.",
-             f"# Start:  python {os.path.abspath(__file__)} submit {os.path.basename(out)}",
+             f"# Start or resume:  autophonon start {os.path.basename(out)}",
              "",
              f"name: {show(args.name)}",
              f"structure: {show(rel(args.structure))}",
@@ -1435,13 +1516,17 @@ def cmd_init(argv):
             lines.append(("" if value != a.default else "# ") + key + comment)
     with open(out, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Wrote {out}")
-    print(f"Review it, then: python {os.path.abspath(__file__)} submit {out}")
+    print(f"Wrote {os.path.relpath(out)}")
 
 
 def main():
     argv = sys.argv[1:]
     cmd = argv.pop(0) if argv and argv[0] in COMMANDS else "run"
+    if not sys.argv[1:]:
+        print("Usage" + __doc__.split("Usage", 1)[1])
+        return
+    if cmd == "start":
+        return cmd_start(argv)
     if cmd == "status":
         return cmd_status(argv)
     if cmd == "init":

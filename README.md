@@ -20,71 +20,65 @@ finished calculations are kept.
 ## Setup (once)
 
 ```bash
-git clone git@github.com:matthewkim06/Phonons.git
-cd Phonons
+git clone git@github.com:matthewkim06/Phonons.git ~/Phonons
 module load anaconda
-conda env create -f environment.yml      # creates the "autophonon" env
-```
+conda env create -f ~/Phonons/environment.yml      # the "autophonon" env
+mkdir -p ~/bin && ln -s ~/Phonons/autophonon ~/bin/  # puts `autophonon` on your PATH
 
-Quantum ESPRESSO is not installed by conda. The Slurm jobs load the cluster
-module (`gcc/12.2.0 openmpi/4.1.4 quantum-espresso/7.1` by default; change
-`modules` in your config if you need another build).
-
-**Pseudopotentials.** Use one UPF file per element in a directory. We use
-[PseudoDojo](http://www.pseudo-dojo.org) norm-conserving, PBE, scalar-relativistic,
-"standard" accuracy, v0.4 (UPF format):
-
-```bash
+# Pseudopotentials: PseudoDojo NC, PBE, scalar-relativistic, standard, v0.4
 mkdir -p ~/pseudo/dojo-pbe && cd ~/pseudo/dojo-pbe
 curl -LO http://www.pseudo-dojo.org/pseudos/nc-sr-04_pbe_standard_upf.tgz
 tar xzf nc-sr-04_pbe_standard_upf.tgz && rm nc-sr-04_pbe_standard_upf.tgz
 ```
 
-The script reads the element from each file's header, so file names don't
-matter. A directory may hold the whole table; only the elements in your
-structure are used. Ultrasoft/PAW files work too, but set `scan_dual: 12` or
-higher, since they need a larger ecutrho/ecutwfc ratio.
+After this you never need `module load` or `conda activate`: the `autophonon`
+command finds the environment itself. `~/pseudo/dojo-pbe` is the default
+pseudopotential directory; to use another set, `export
+AUTOPHONON_PSEUDO_DIR=/path/to/upfs` (e.g. in `~/.bashrc`) or pass
+`--pseudo-dir`. Only the elements in your structure are used. Ultrasoft/PAW
+files work too, but add `--scan-dual 12` since they need a larger
+ecutrho/ecutwfc ratio.
+
+Quantum ESPRESSO comes from the cluster module (`gcc/12.2.0 openmpi/4.1.4
+quantum-espresso/7.1` by default; `--modules` to change).
 
 ## Running a calculation
 
 ```bash
-conda activate autophonon
-AP=~/Phonons/autophonon.py             # wherever you cloned it
-
-# 1. Write a config file (every option listed with its default, commented out)
-python $AP init --name NaCl --structure NaCl.cif --pseudo-dir ~/pseudo/dojo-pbe
-
-# 2. Optional: see exactly what will be submitted
-python $AP run NaCl.yaml --dry-run
-
-# 3. Start it. This submits a small 1-core "driver" job that submits and
-#    waits for the real QE jobs. You can log out.
-python $AP submit NaCl.yaml
-
-# 4. Check on it at any time
-python $AP status NaCl.yaml
+mkdir -p ~/calcs/GaAs && cd ~/calcs/GaAs
+autophonon start GaAs:zincblende:5.653     # or: autophonon start GaAs.cif
+autophonon status                          # any time, in this folder
 ```
 
-Outputs go to `NaCl_auto/` next to the config file. The driver's log is
-`NaCl_auto/driver.log`.
+`start` builds the structure (or reads your CIF/POSCAR/any ASE format),
+writes `GaAs.yaml` with every option and its default, and submits a 1-core
+driver job that runs all stages through Slurm. You can log out. Results go to
+`GaAs_auto/`; the log is `GaAs_auto/driver.log`.
 
-The structure can be anything ASE reads (CIF, POSCAR, pw.x input, ...). It is
-symmetrized and standardized first, so a conventional or primitive cell are
-both fine.
-
-**Metals:** add `metal: true` (Marzari–Vanderbilt smearing, `degauss` 0.02 Ry
-by default; no Born charges).
+* Built structures: `Formula:structure:a[:c]` with sc, fcc, bcc, hcp, diamond,
+  zincblende, rocksalt, cesiumchloride, fluorite or wurtzite, e.g.
+  `Al:fcc:4.05`, `MgO:rocksalt:4.21`, `GaN:wurtzite:3.19:5.19`. Use the
+  experimental lattice constant; it is relaxed anyway.
+* Options as flags on the first `start` (they're saved in the YAML), e.g.
+  metals: `autophonon start Al:fcc:4.05 --metal` (Marzari–Vanderbilt
+  smearing, no Born charges). `autophonon run -h` lists all options.
+* To change options later, edit `GaAs.yaml` and run `autophonon start GaAs.yaml`.
+  The same command resumes after a failure; finished work is kept.
+* `--dry-run` on any `start` writes the inputs and job scripts without
+  submitting.
+* The structure is symmetrized and standardized first, so conventional or
+  primitive cells are both fine.
 
 **Small-gap semiconductors (GaAs, InAs, InSb, Ge, ...):** PBE nearly closes
 their band gap at the relaxed lattice constant, so the computed dielectric
 constant blows up and the LO–TO splitting comes out wrong (the dispersion
-itself is fine). The run warns about this in the log and in `status` when the
-gap is below 0.5 eV or epsilon_inf is above 50. Two fixes, either in the config:
+itself is fine). `status` warns when the gap is below 0.5 eV or epsilon_inf is
+above 50. Fix it by adding one line to the YAML and running `start` again
+(only the small Born step is redone):
 
 ```yaml
-born_volume: input          # compute epsilon/Z* at the input structure's volume
-                            # (give it the experimental lattice constant)
-born_file: GaAs_exp.BORN    # or: use your own epsilon_inf and Z* (phonopy BORN format)
+born_volume: input          # compute epsilon/Z* at the input (experimental) volume
+born_file: GaAs_exp.BORN    # or use your own epsilon_inf and Z* (phonopy BORN format)
 ```
 
 A BORN file has the 9 components of epsilon_inf on one line, then one line of
@@ -96,12 +90,6 @@ A BORN file has the 9 components of epsilon_inf on one line, then one line of
 2.07 0 0 0 2.07 0 0 0 2.07
 -2.07 0 0 0 -2.07 0 0 0 -2.07
 ```
-
-Changing either option on a finished run only redoes the Born step (old
-outputs are kept in `04_phonopy/born/previous_*`); just `submit` again.
-
-**Changing options:** uncomment lines in the YAML, or pass `--flags` on the
-command line (flags override the file). `python $AP run -h` lists everything.
 
 ## Reading the results
 
@@ -119,7 +107,7 @@ command line (flags override the file). `python $AP run -h` lists everything.
   ph = phonopy.load("NaCl_auto/04_phonopy/phonopy_params.yaml")
   ph.run_mesh([20, 20, 20]); ph.run_thermal_properties(t_max=1000)
   ```
-* `status` prints the converged cutoffs, relaxed lattice, Γ frequencies and
+* `autophonon status` prints the converged cutoffs, relaxed lattice, Γ frequencies and
   lowest frequency.
 
 ### Sanity checks before using the numbers
@@ -141,12 +129,12 @@ command line (flags override the file). `python $AP run -h` lists everything.
 
 | Symptom | What to do |
 |---|---|
-| `status` says the driver is not running, stages pending | Look at the end of `driver.log`, fix the cause, then `submit` again; it resumes. |
-| `Stage ... failed; incomplete outputs` | Read the `.out` and `.err` files in that stage directory (walltime, memory, SCF not converging). Raise `walltime` / `disp_walltime` if needed, then `submit` again. |
+| `status` says the driver is not running, stages pending | Look at the end of `driver.log`, fix the cause, then `autophonon start <name>.yaml`; it resumes. |
+| `Stage ... failed; incomplete outputs` | Read the `.out` and `.err` files in that stage directory (walltime, memory, SCF not converging). Raise `walltime` / `disp_walltime` in the YAML if needed, then `autophonon start <name>.yaml`. |
 | `not converged within [...]; extend the list` | Raise the top of `ecutwfc_list` (e.g. `30:150:10`) or `dual_list`. |
 | `Disk quota exceeded` | QE scratch goes to `$RCAC_SCRATCH/autophonon/` and is deleted after each stage, so check what else is filling home/depot (`myquota`). |
-| `already has a driver job ...` | A driver is already working in that directory. Use `status`, or `scancel` that job first. |
-| Want to redo one stage | Delete that stage's directory and its entry under `results` in `state.json` (and everything after it), then `submit` again. Simplest is a new `workdir`. |
+| `already has a driver job ...` | A driver is already working in that directory. Use `autophonon status`, or `scancel` that job first. |
+| Want to redo one stage | Delete that stage's directory and its entry under `results` in `state.json` (and everything after it), then `autophonon start <name>.yaml`. Simplest is a new `workdir`. |
 
 The driver job requests 3 days and resubmits itself shortly before the
 limit, so long phonon runs need no babysitting.

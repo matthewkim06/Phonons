@@ -1,0 +1,18 @@
+#!/bin/bash
+# Runs autophonon.py with the right Python; no `module load` / `conda activate`
+# needed. Link it onto your PATH once:  ln -s "$PWD/autophonon" ~/bin/
+here="$(dirname "$(readlink -f "$0")")"
+py="${AUTOPHONON_PYTHON:-}"
+if [ -z "$py" ]; then
+    for c in "$HOME"/.conda/envs/autophonon/bin/python "$HOME"/.conda/envs/*/autophonon/bin/python \
+             "$HOME"/.conda/envs/phonopy/bin/python "$HOME"/.conda/envs/*/phonopy/bin/python; do
+        if [ -x "$c" ]; then py="$c"; break; fi
+    done
+fi
+if [ -z "$py" ]; then
+    echo "autophonon: no conda env found. Create it once with:" >&2
+    echo "  module load anaconda && conda env create -f $here/environment.yml" >&2
+    echo "or point AUTOPHONON_PYTHON at a python that has phonopy." >&2
+    exit 1
+fi
+exec "$py" "$here/autophonon.py" "$@"
