@@ -75,6 +75,8 @@ def read_upf_header(path):
         info["type"] = t.group(1).upper() if t else "NC"
         fn = re.search(r'functional\s*=\s*"([^"]*)"', head)
         info["functional"] = fn.group(1).strip() if fn else "?"
+        z = re.search(r'z_valence\s*=\s*"\s*([-+.\dEe]+)\s*"', head)
+        info["zval"] = float(z.group(1)) if z else None
     else:                                   # UPF v1 <PP_HEADER> lines
         m = re.search(r"<PP_HEADER>\s*\n\s*\S+.*\n\s*([A-Za-z]{1,2})\s+Element", head)
         if not m:
@@ -83,6 +85,8 @@ def read_upf_header(path):
         info["type"] = ("PAW" if "PAW" in head[:3000] else
                         "US" if re.search(r"\bUS\b", head[:3000]) else "NC")
         info["functional"] = "?"
+        z = re.search(r"([-+.\dEe]+)\s+Z valence", head)
+        info["zval"] = float(z.group(1)) if z else None
     info["element"] = info["element"].capitalize()
     if info["type"] in ("SL", "1/R"):
         info["type"] = "NC"
@@ -174,7 +178,8 @@ def num_pools(lattice, positions, numbers, mesh, ntasks, max_pools):
 # QE input writing and output parsing
 # ----------------------------------------------------------------------------
 def pw_input(calc, prefix, lattice, positions, symbols, ecutwfc, ecutrho, mesh,
-             cfg, outdir, conv_thr=1e-10, extra_control="", extra_sections=""):
+             cfg, outdir, conv_thr=1e-10, extra_control="", extra_system="",
+             extra_sections=""):
     """pw.x input with ibrav=0; lattice in Angstrom, positions fractional."""
     from ase.data import atomic_masses, atomic_numbers
     species = list(dict.fromkeys(symbols))
@@ -186,7 +191,7 @@ def pw_input(calc, prefix, lattice, positions, symbols, ecutwfc, ecutrho, mesh,
          f"  tprnfor     = .true.\n  tstress     = .true.\n{extra_control}/\n"
          f"&SYSTEM\n  ibrav       = 0\n  nat         = {len(symbols)}\n"
          f"  ntyp        = {len(species)}\n  ecutwfc     = {ecutwfc}\n"
-         f"  ecutrho     = {ecutrho}\n{occ}/\n"
+         f"  ecutrho     = {ecutrho}\n{occ}{extra_system}/\n"
          f"&ELECTRONS\n  conv_thr    = {conv_thr:.1e}\n  mixing_beta = 0.7\n/\n"
          f"{extra_sections}")
     s += "CELL_PARAMETERS angstrom\n"
@@ -200,6 +205,47 @@ def pw_input(calc, prefix, lattice, positions, symbols, ecutwfc, ecutrho, mesh,
         s += f"  {sym:3s} %16.10f %16.10f %16.10f\n" % tuple(p)
     s += "K_POINTS automatic\n  %d %d %d 0 0 0\n" % tuple(mesh)
     return s
+
+
+def parse_born(path):
+    """(epsilon_inf eigen-ish diagonal, Z* array) from a phonopy BORN file.
+
+    Format: optional factor/comment line, a line with the 9 components of
+    epsilon_inf, then one line of 9 Z* components per independent atom."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            parts = line.split("#")[0].split()
+            if len(parts) == 9:
+                rows.append([float(x) for x in parts])
+    if len(rows) < 2:
+        raise ValueError(f"{path}: expected an epsilon line and at least one Z* line "
+                         "with 9 numbers each (phonopy BORN format)")
+    eps = np.array(rows[0]).reshape(3, 3)
+    return np.diag(eps), np.array(rows[1:])
+
+
+def born_check(scf_out, eps_diag, zstar, min_gap=0.5, max_eps=50.0):
+    """Band gap from the Born scf and a warning when LO-TO can't be trusted."""
+    gap = None
+    if os.path.exists(scf_out):
+        with open(scf_out, errors="ignore") as f:
+            m = re.findall(r"highest occupied, lowest unoccupied level \(ev\):\s+(\S+)\s+(\S+)",
+                           f.read())
+        if m:
+            gap = float(m[-1][1]) - float(m[-1][0])
+    problems = []
+    if gap is not None and gap < min_gap:
+        problems.append(f"band gap only {gap:.2f} eV")
+    if eps_diag.max() > max_eps:
+        problems.append(f"epsilon_inf = {eps_diag.max():.0f}")
+    warning = None
+    if problems:
+        warning = (", ".join(problems) + ": the LO-TO splitting is not reliable "
+                   "(DFT gap problem). Use born_volume: input to compute it at the input "
+                   "(e.g. experimental) volume, or born_file: with literature values.")
+    return {"gap_ev": gap, "eps_inf_max": float(eps_diag.max()),
+            "zstar_max": float(np.abs(zstar).max()), "warning": warning}
 
 
 def output_done(path):
@@ -524,6 +570,26 @@ class Workflow:
             log(f"  WARNING: pseudopotentials use different functionals: {sorted(functionals)}")
         self.ref_dual = a.scan_dual
 
+    def _born_settings_changed(self, born_dir, born_path):
+        """Move old Born outputs aside if born_volume changed since they were made."""
+        want = {"born_volume": self.args.born_volume}
+        have = self.state.get("born_settings")
+        if have is None and os.path.exists(os.path.join(born_dir, "ph.out")):
+            have = {"born_volume": "relaxed"}        # runs made before this option
+        if have is not None and have != want:
+            old = os.path.join(born_dir, f"previous_{have['born_volume']}")
+            os.makedirs(old, exist_ok=True)
+            for fn in ("scf.in", "scf.out", "ph.in", "ph.out", "BORN"):
+                if os.path.exists(os.path.join(born_dir, fn)):
+                    os.replace(os.path.join(born_dir, fn), os.path.join(old, fn))
+            if os.path.exists(born_path):
+                os.remove(born_path)
+            self.state.get("jobs", {}).pop("born", None)
+            log(f"  born_volume changed ({have['born_volume']} -> {want['born_volume']}); "
+                f"old Born outputs moved to {os.path.relpath(old, self.work)}")
+        self.state["born_settings"] = want
+        self.save()
+
     def _npool(self, lattice, positions, numbers, mesh):
         return num_pools(lattice, positions, numbers, mesh, self.args.ntasks, self.args.max_pools)
 
@@ -682,26 +748,42 @@ class Workflow:
                          a.disp_walltime))
 
         born_dir = os.path.join(directory, "born")
+        born_path = os.path.join(directory, "BORN")
         prim = ph.primitive
-        if not a.metal:
+        compute_born = not a.metal and not a.born_file
+        if a.metal and a.born_file:
+            log("  NOTE: born_file is ignored for metals (no LO-TO correction)")
+        if compute_born:
             os.makedirs(born_dir, exist_ok=True)
             p_lat = prim.cell * BOHR
+            if a.born_volume == "input":
+                # Same cell and atom order, isotropically rescaled to the input
+                # structure's volume (e.g. the experimental lattice)
+                v_in = abs(np.linalg.det(self.state["input"]["lattice"]))
+                v_rel = abs(np.linalg.det(std["prim_lattice"]))
+                p_lat = p_lat * (v_in / v_rel) ** (1 / 3)
+            self._born_settings_changed(born_dir, born_path)
             p_mesh = kmesh(p_lat, a.kspacing)
             p_npool = num_pools(p_lat, prim.scaled_positions, prim.numbers, p_mesh,
                                 a.ntasks, a.max_pools)
+            # A few empty bands so pw.x reports the gap (checked below)
+            zval = [self.cfg["pseudos"][el]["zval"] for el in prim.symbols]
+            nbnd = (f"  nbnd        = {math.ceil(sum(zval) / 2) + 4}\n"
+                    if None not in zval else "")
             # Always (re)written: phonopy-qe-born reads the structure from it
             with open(os.path.join(born_dir, "scf.in"), "w") as f:
                 f.write(pw_input("scf", a.name, p_lat, prim.scaled_positions,
                                  list(prim.symbols), ew, er, p_mesh, self.cfg,
-                                 scratch_dir(self.cfg, born_dir), conv_thr=1e-12))
-        if not a.metal and not output_done(os.path.join(born_dir, "ph.out")):
+                                 scratch_dir(self.cfg, born_dir), conv_thr=1e-12,
+                                 extra_system=nbnd))
+        if compute_born and not output_done(os.path.join(born_dir, "ph.out")):
             with open(os.path.join(born_dir, "ph.in"), "w") as f:
                 f.write(f"Born effective charges and dielectric tensor\n&INPUTPH\n"
                         f"  prefix = '{a.name}'\n  outdir = '{scratch_dir(self.cfg, born_dir)}'\n  tr2_ph = 1.0d-16\n"
                         f"  epsil  = .true.\n  trans  = .false.\n  fildyn = '{a.name}.dynG'\n/\n"
                         "0.0 0.0 0.0\n")
         # Submit the displacement jobs and the Born job together
-        if not a.metal:
+        if compute_born:
             born_job = (f"{a.name}_born", [("pw.x", p_npool, "scf.in", "scf.out"),
                                            ("ph.x", p_npool, "ph.in", "ph.out")], a.walltime)
             # run_stage blocks, so start the Born job first if needed
@@ -713,7 +795,7 @@ class Workflow:
                     ids[born_job[0]] = jobid
                     self.save()
         self.run_stage("disp", directory, jobs)
-        if not a.metal:
+        if compute_born:
             self.run_stage("born", born_dir, [born_job])
 
         from phonopy.interface.qe import parse_set_of_forces
@@ -721,18 +803,25 @@ class Workflow:
         outs = [os.path.join(directory, f"disp-{i:03d}.out") for i in range(1, len(jobs) + 1)]
         ph.forces = parse_set_of_forces(nat, outs, verbose=False)
         write_FORCE_SETS(ph.dataset, filename=os.path.join(directory, "FORCE_SETS"))
-        bindir = os.path.dirname(sys.executable)
-        if not a.metal:
+        res.pop("born_check", None)
+        if a.born_file and not a.metal:
+            eps, zstar = parse_born(a.born_file)        # validates the format
+            shutil.copy(a.born_file, born_path)
+            res["born_check"] = {"source": os.path.abspath(a.born_file),
+                                 "eps_inf_max": float(eps.max()),
+                                 "zstar_max": float(np.abs(zstar).max())}
+            log(f"  BORN copied from {a.born_file} (epsilon_inf {eps.max():.2f}, "
+                f"max |Z*| {np.abs(zstar).max():.2f})")
+        elif compute_born:
+            bindir = os.path.dirname(sys.executable)
             r = subprocess.run([os.path.join(bindir, "phonopy-qe-born"), "scf.in", "ph.out"],
                                cwd=born_dir, check=True, capture_output=True, text=True)
             born_text = r.stdout
-            # Lines 3+ of BORN are the Z* tensors; all ~0 for non-polar crystals (Si)
-            zstar = np.array([[float(x) for x in l.split()]
-                              for l in born_text.splitlines()[2:] if l.strip()])
-            born_path = os.path.join(directory, "BORN")
-            if zstar.size and np.abs(zstar).max() < 0.05:
-                with open(os.path.join(born_dir, "BORN"), "w") as f:
-                    f.write(born_text)
+            with open(os.path.join(born_dir, "BORN"), "w") as f:
+                f.write(born_text)
+            eps, zstar = parse_born(os.path.join(born_dir, "BORN"))
+            if np.abs(zstar).max() < 0.05:
+                # all ~0 for non-polar crystals (Si): no LO-TO splitting
                 if os.path.exists(born_path):
                     os.remove(born_path)
                 log("  Born charges are ~0 (non-polar crystal): no LO-TO correction; "
@@ -740,7 +829,15 @@ class Workflow:
             else:
                 with open(born_path, "w") as f:
                     f.write(born_text)
-                log("  BORN written")
+                check = born_check(os.path.join(born_dir, "scf.out"), eps, zstar)
+                check["source"] = f"computed ({a.born_volume} volume)"
+                res["born_check"] = check
+                gap = f"{check['gap_ev']:.2f} eV" if check["gap_ev"] is not None else "n/a"
+                log(f"  BORN written (gap {gap}, epsilon_inf {check['eps_inf_max']:.2f}, "
+                    f"max |Z*| {check['zstar_max']:.2f})")
+                if check["warning"]:
+                    log(f"  WARNING: {check['warning']}")
+        self.save()
         log("  FORCE_SETS written")
         return directory
 
@@ -948,7 +1045,7 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
 # Command line and config files
 # ----------------------------------------------------------------------------
 COMMANDS = ("run", "submit", "status", "init")
-PATH_KEYS = ("structure", "pseudo_dir", "workdir", "scratch")
+PATH_KEYS = ("structure", "pseudo_dir", "workdir", "scratch", "born_file")
 REQUIRED = ("name", "structure", "pseudo_dir")
 INTERNAL = {"help", "dry_run"}
 
@@ -991,6 +1088,11 @@ def build_parser():
     g.add_argument("--metal", action="store_true",
                    help="smearing occupations, no Born charges / LO-TO correction")
     g.add_argument("--degauss", type=float, default=0.02, help="Ry, with --metal")
+    g.add_argument("--born-volume", choices=["relaxed", "input"], default="relaxed",
+                   help="cell for epsilon/Z*: the relaxed one, or rescaled to the input "
+                   "structure's volume (use when the DFT gap is too small at the relaxed volume)")
+    g.add_argument("--born-file", help="phonopy BORN file to use instead of computing "
+                   "epsilon/Z* (e.g. experimental values)")
     g = p.add_argument_group("plot")
     g.add_argument("--npoints", type=int, default=101, help="q-points per path segment")
     g.add_argument("--dos-mesh", type=float, default=200.0,
@@ -1200,6 +1302,12 @@ def pipeline(wf, args):
     print(f"  space group {std['spacegroup']}, conventional a,b,c = " +
           ", ".join(f"{np.linalg.norm(v):.4f}" for v in std["conv_lattice"]) + " A")
     print(f"  Gamma frequencies (cm^-1): {summary['gamma_cm1']}")
+    bc = res.get("born_check")
+    if bc:
+        print(f"  Born charges: {bc['source']}, epsilon_inf {bc['eps_inf_max']:.2f}, "
+              f"max |Z*| {bc['zstar_max']:.2f}")
+        if bc.get("warning"):
+            print(f"  WARNING: {bc['warning']}")
     if summary["min_freq_cm1"] < -5:
         print(f"  WARNING: imaginary modes down to {summary['min_freq_cm1']:.1f} cm^-1")
 
@@ -1254,6 +1362,13 @@ def cmd_status(argv):
         print(f"phonons: {done}/{len(disp)} displacements done{extra}")
     else:
         print("phonons: pending")
+    bc = res.get("born_check")
+    if bc:
+        gap = f", gap {bc['gap_ev']:.2f} eV" if bc.get("gap_ev") is not None else ""
+        print(f"born:    {bc['source']}{gap}, epsilon_inf {bc['eps_inf_max']:.2f}, "
+              f"max |Z*| {bc['zstar_max']:.2f}")
+        if bc.get("warning"):
+            print(f"         WARNING: {bc['warning']}")
     if "summary" in res:
         sm = res["summary"]
         print(f"result:  Gamma (cm^-1) {sm['gamma_cm1']}; lowest frequency "

@@ -75,6 +75,31 @@ both fine.
 **Metals:** add `metal: true` (Marzari–Vanderbilt smearing, `degauss` 0.02 Ry
 by default; no Born charges).
 
+**Small-gap semiconductors (GaAs, InAs, InSb, Ge, ...):** PBE nearly closes
+their band gap at the relaxed lattice constant, so the computed dielectric
+constant blows up and the LO–TO splitting comes out wrong (the dispersion
+itself is fine). The run warns about this in the log and in `status` when the
+gap is below 0.5 eV or epsilon_inf is above 50. Two fixes, either in the config:
+
+```yaml
+born_volume: input          # compute epsilon/Z* at the input structure's volume
+                            # (give it the experimental lattice constant)
+born_file: GaAs_exp.BORN    # or: use your own epsilon_inf and Z* (phonopy BORN format)
+```
+
+A BORN file has the 9 components of epsilon_inf on one line, then one line of
+9 Z* components per symmetry-independent atom (`#` starts a comment):
+
+```
+# GaAs, experimental
+10.9 0 0 0 10.9 0 0 0 10.9
+2.07 0 0 0 2.07 0 0 0 2.07
+-2.07 0 0 0 -2.07 0 0 0 -2.07
+```
+
+Changing either option on a finished run only redoes the Born step (old
+outputs are kept in `04_phonopy/born/previous_*`); just `submit` again.
+
 **Changing options:** uncomment lines in the YAML, or pass `--flags` on the
 command line (flags override the file). `python $AP run -h` lists everything.
 
@@ -133,6 +158,7 @@ limit, so long phonon runs need no babysitting.
 | NaCl | ionic, LO–TO; ecutwfc 80 / ecutrho 640 Ry, a = 5.688 Å, TO 159 / LO 251 cm⁻¹ at Γ (PBE) | done |
 | Si | covalent, non-polar; 30 / 120 Ry, a = 5.468 Å, Γ optical 504 cm⁻¹, TA(X) 147, TA(L) 112 cm⁻¹ | done |
 | Al | metal; 40 / 160 Ry, a = 4.038 Å, X: LA 323, TA 191 cm⁻¹ (expt. 323, 193) | done |
+| GaAs | small PBE gap (0.15 eV at the relaxed a = 5.747 Å): computed epsilon_inf = 546 and LO–TO only 1 cm⁻¹, flagged by the gap check. With `born_file` (expt. epsilon_inf 10.9, Z* 2.07): TO 252 / LO 274 cm⁻¹ (expt. 268 / 292) | done |
 | GaN (wurtzite) | polar, hexagonal; 80 / 320 Ry, a = 3.219, c = 5.244 Å, Z*(Ga) = 2.65 (⊥c) / 2.79 (∥c), E2(low) 136, A1(TO) 503, E1(TO) 526 cm⁻¹; ~3 h per 128-atom displacement job | done |
 
 All PBE with the PseudoDojo set above. Inputs and outputs are on Negishi in
