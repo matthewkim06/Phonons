@@ -64,6 +64,9 @@ driver job that runs all stages through Slurm. You can log out. Results go to
   smearing, no Born charges). `autophonon run -h` lists all options.
 * To change options later, edit `GaAs.yaml` and run `autophonon start GaAs.yaml`.
   The same command resumes after a failure; finished work is kept.
+* `dos: false` in the YAML (or `--dos false`) draws the dispersion without the
+  DOS panel; rerunning `autophonon run <name>.yaml` on a finished run just
+  redraws the plot.
 * `--dry-run` on any `start` writes the inputs and job scripts without
   submitting.
 * The structure is symmetrized and standardized first, so conventional or

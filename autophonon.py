@@ -1057,18 +1057,20 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
     dist, freqs = run(ph)
     bare = run(ph_bare)[1] if ph_bare is not None else None
 
-    ph.run_mesh(a.dos_mesh, with_eigenvectors=True, is_mesh_symmetry=False)
-    ph.run_total_dos(sigma=a.dos_sigma)
-    ph.run_projected_dos(sigma=a.dos_sigma)
-    e_dos = ph.total_dos.frequency_points * THZ_TO_CM
-    tdos = ph.total_dos.dos / THZ_TO_CM
-    syms = list(ph.primitive.symbols)
-    elements = list(dict.fromkeys(syms))
-    pdos = {el: sum(ph.projected_dos.projected_dos[i] for i, s in enumerate(syms) if s == el)
-            / THZ_TO_CM for el in elements}
-
-    fig, (ax, axd) = plt.subplots(1, 2, figsize=(7.5, 4.5), sharey=True,
-                                  gridspec_kw={"width_ratios": [3, 1], "wspace": 0.05})
+    if a.dos:
+        ph.run_mesh(a.dos_mesh, with_eigenvectors=True, is_mesh_symmetry=False)
+        ph.run_total_dos(sigma=a.dos_sigma)
+        ph.run_projected_dos(sigma=a.dos_sigma)
+        e_dos = ph.total_dos.frequency_points * THZ_TO_CM
+        tdos = ph.total_dos.dos / THZ_TO_CM
+        syms = list(ph.primitive.symbols)
+        elements = list(dict.fromkeys(syms))
+        pdos = {el: sum(ph.projected_dos.projected_dos[i] for i, s in enumerate(syms) if s == el)
+                / THZ_TO_CM for el in elements}
+        fig, (ax, axd) = plt.subplots(1, 2, figsize=(7.5, 4.5), sharey=True,
+                                      gridspec_kw={"width_ratios": [3, 1], "wspace": 0.05})
+    else:
+        fig, ax = plt.subplots(figsize=(6.0, 4.5))
     for i, d in enumerate(dist):
         if bare is not None:
             lb = ax.plot(d, bare[i], color="0.6", lw=1.0, ls="--")
@@ -1099,14 +1101,15 @@ def plot_phonons(ph, ph_bare, bands, labels, connections, out_png, a):
         ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=8,
                   frameon=False)
 
-    axd.plot(tdos, e_dos, color="k", lw=1.2, label="total")
-    if len(elements) > 1:          # one element: the projection equals the total
-        for j, el in enumerate(elements):
-            axd.plot(pdos[el], e_dos, color=SERIES[j % len(SERIES)], lw=1.2, label=el)
-    axd.set_xlim(0, tdos.max() * 1.1)
-    axd.set_xticks([])
-    axd.set_xlabel("DOS")
-    axd.legend(loc="upper right", fontsize=8, frameon=False)
+    if a.dos:
+        axd.plot(tdos, e_dos, color="k", lw=1.2, label="total")
+        if len(elements) > 1:          # one element: the projection equals the total
+            for j, el in enumerate(elements):
+                axd.plot(pdos[el], e_dos, color=SERIES[j % len(SERIES)], lw=1.2, label=el)
+        axd.set_xlim(0, tdos.max() * 1.1)
+        axd.set_xticks([])
+        axd.set_xlabel("DOS")
+        axd.legend(loc="upper right", fontsize=8, frameon=False)
     fig.savefig(out_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -1185,6 +1188,8 @@ def build_parser():
                    "epsilon/Z* (e.g. experimental values)")
     g = p.add_argument_group("plot")
     g.add_argument("--npoints", type=int, default=101, help="q-points per path segment")
+    g.add_argument("--dos", type=lambda v: str(v).lower() in ("1", "true", "yes"), default=True,
+                   help="draw the phonon DOS panel next to the dispersion (true/false)")
     g.add_argument("--dos-mesh", type=float, default=200.0,
                    help="phonopy mesh length (bohr) for the DOS")
     g.add_argument("--dos-sigma", type=float, default=0.08, help="DOS smearing, THz")
